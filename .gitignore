@@ -1,0 +1,17 @@
+node_modules
+.next
+test-results
+*.exe
+*.db
+anheyu-app
+anheyu-app.exe
+anheyu-app-linux-amd64
+anheyu-app-linux-arm64
+anheyu-app-windows.exe
+data/storage
+data/cache
+.env
+themes
+backup
+static
+.DS_Store

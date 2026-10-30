@@ -1,0 +1,431 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import { addToast, Spinner } from "@heroui/react";
+import { useRouter } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
+import TurndownService from "turndown";
+import { marked } from "marked";
+import { EditorHeader } from "./EditorHeader";
+import { EditorToolbar, type EditorMode } from "./EditorToolbar";
+import { TiptapEditor } from "./TiptapEditor";
+import { SourceCodeEditor } from "./SourceCodeEditor";
+import { EditorSidebar, TOCContent } from "./EditorSidebar";
+import { useArticleEditor } from "./use-article-editor";
+import { useArticleMeta } from "./use-article-meta";
+import { useAutoSave } from "./use-auto-save";
+import { useArticleForEdit } from "@/hooks/queries/use-post-management";
+import { processHtmlForSave } from "@/lib/content-processor";
+import { turndownArticleMarkdown } from "@/lib/editor-tabs-export";
+import { registerCustomRules } from "@/lib/turndown-rules";
+import { registerMarkedExtensions, fixTaskListHtml } from "@/lib/marked-extensions";
+import { MobileToolbar } from "./MobileToolbar";
+import { articleApi } from "@/lib/api/article";
+import { plainTextFromHtmlSource, roughPlainTextFromMarkdown } from "@/lib/article-summary";
+import { useAuthStore } from "@/store/auth-store";
+
+import type { Editor } from "@tiptap/react";
+
+interface ArticleEditorPageProps {
+  /** 文章 ID（编辑模式时传入） */
+  articleId?: string;
+}
+
+/** 字数统计组件 - 固定在编辑器左下角 */
+function WordCount({ editor }: { editor: Editor | null }) {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    if (!editor) return;
+
+    const update = () => {
+      const text = editor.state.doc.textContent;
+      // 统计中文字符 + 英文单词
+      const chineseChars = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+      const englishWords = (text.replace(/[\u4e00-\u9fff\u3400-\u4dbf]/g, "").match(/[a-zA-Z0-9]+/g) || []).length;
+      setCount(chineseChars + englishWords);
+    };
+
+    update();
+    editor.on("update", update);
+    return () => {
+      editor.off("update", update);
+    };
+  }, [editor]);
+
+  return (
+    <div className="absolute bottom-2 left-3 pointer-events-none z-10">
+      <span className="text-xs text-muted-foreground tabular-nums">{count}字</span>
+    </div>
+  );
+}
+
+/** HTML -> Markdown 转换器（单例） */
+const turndownService = new TurndownService({
+  headingStyle: "atx",
+  codeBlockStyle: "fenced",
+  bulletListMarker: "-",
+});
+registerCustomRules(turndownService);
+registerMarkedExtensions(marked);
+
+export function ArticleEditorPage({ articleId }: ArticleEditorPageProps) {
+  const router = useRouter();
+
+  const isRouteEditMode = !!articleId;
+
+  /**
+   * draftArticleId 是当前页面实际正在编辑的文章 ID：
+   * 编辑已有文章时，初始值就是 articleId
+   * 新建文章时，初始值是 undefined
+   * 第一次自动保存创建草稿成功后，会被设置成后端返回的新 ID
+   */
+  const [draftArticleId, setDraftArticleId] = useState<string | undefined>(articleId);
+
+  // currentArticleId 是后续保存以及自动保存真正使用的 ID
+  const currentArticleId = draftArticleId;
+
+  useEffect(() => {
+    setDraftArticleId(articleId);
+  }, [articleId]);
+
+  const isEditMode = !!currentArticleId;
+  const isAdmin = useAuthStore(state => state.user?.userGroupID === 1 || state.roles.includes("1"));
+
+  // 编辑模式：加载文章数据
+  const { data: article, isLoading: isLoadingArticle } = useArticleForEdit(articleId ?? "", {
+    enabled: isRouteEditMode,
+  });
+
+  // 标题状态
+  const [title, setTitle] = useState("");
+  const [prevArticleId, setPrevArticleId] = useState<string | null>(null);
+
+  // 右侧面板
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+
+  // 专注模式
+  const [focusMode, setFocusMode] = useState(false);
+  const toggleFocusMode = useCallback(() => setFocusMode(prev => !prev), []);
+
+  useEffect(() => {
+    if (!focusMode) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFocusMode(false);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [focusMode]);
+
+  // 文章元数据
+  const { meta, updateField, initFromData, getSubmitData } = useArticleMeta(undefined, {
+    isAdmin,
+    maxSummaries: 1,
+  });
+
+  // Tiptap 编辑器实例
+  const editor = useArticleEditor({
+    initialContent: "",
+    placeholder: "开始编写内容...",
+  });
+
+  // 编辑模式切换（可视化 / HTML / Markdown）
+  const [editorMode, setEditorMode] = useState<EditorMode>("visual");
+  const [sourceContent, setSourceContent] = useState("");
+  const visualBackupRef = useRef<Record<string, unknown> | null>(null);
+  const sourceModifiedRef = useRef(false);
+
+  const handleSourceChange = useCallback((value: string) => {
+    setSourceContent(value);
+    sourceModifiedRef.current = true;
+  }, []);
+
+  const handleModeChange = useCallback(
+    (newMode: EditorMode) => {
+      if (newMode === editorMode) return;
+
+      if (editorMode === "visual") {
+        if (editor && !editor.isDestroyed) {
+          visualBackupRef.current = editor.getJSON() as Record<string, unknown>;
+        }
+        sourceModifiedRef.current = false;
+
+        const rawHtml = editor?.getHTML() ?? "";
+        const processedHtml = processHtmlForSave(rawHtml);
+        if (newMode === "html") {
+          setSourceContent(processedHtml);
+        } else {
+          setSourceContent(turndownArticleMarkdown(editor, turndownService, processedHtml));
+        }
+      } else if (newMode === "visual") {
+        if (!sourceModifiedRef.current && visualBackupRef.current) {
+          if (editor && !editor.isDestroyed) {
+            const backupSnapshot = visualBackupRef.current;
+            queueMicrotask(() => editor.commands.setContent(backupSnapshot));
+          }
+        } else if (editorMode === "html") {
+          if (editor && !editor.isDestroyed) {
+            queueMicrotask(() => editor.commands.setContent(sourceContent));
+          }
+        } else {
+          const html = fixTaskListHtml(marked.parse(sourceContent, { async: false }) as string);
+          if (editor && !editor.isDestroyed) {
+            queueMicrotask(() => editor.commands.setContent(html));
+          }
+        }
+        visualBackupRef.current = null;
+      } else {
+        if (editorMode === "html") {
+          setSourceContent(turndownService.turndown(sourceContent));
+        } else {
+          setSourceContent(fixTaskListHtml(marked.parse(sourceContent, { async: false }) as string));
+        }
+      }
+
+      setEditorMode(newMode);
+    },
+    [editorMode, editor, sourceContent]
+  );
+
+  // 分类和标签列表
+  const { data: categories = [], isLoading: isLoadingCategories } = useQuery({
+    queryKey: ["post-categories"],
+    queryFn: () => articleApi.getCategoryList(),
+    staleTime: 1000 * 60 * 5,
+  });
+  const { data: tags = [], isLoading: isLoadingTags } = useQuery({
+    queryKey: ["post-tags"],
+    queryFn: () => articleApi.getTagList("count"),
+    staleTime: 1000 * 60 * 5,
+  });
+
+  const handleArticleCreated = useCallback((id: string) => {
+    setDraftArticleId(id);
+    if (typeof window !== "undefined") {
+      window.history.replaceState(window.history.state, "", `/admin/post-management/${id}/edit`);
+      // 原地更新 URL 不会重新执行路由 metadata；保留站点模板后缀且不重挂载编辑器。
+      document.title = document.title.replace(/^新建文章(?= \| |$)/, "编辑文章");
+    }
+  }, []);
+
+  // 自动保存与手动保存共用同一个串行队列
+  const {
+    status: autoSaveStatus,
+    lastSavedAt,
+    isSaving,
+    saveNow,
+    flushSave,
+  } = useAutoSave({
+    articleId: currentArticleId,
+    onArticleCreated: handleArticleCreated,
+    editor,
+    title,
+    getSubmitData,
+    interval: 30000,
+    enabled: true,  // 新建页也启用自动保存，真正是否创建草稿由 useAutoSave 内部判断（标题和内容都为空不保存）
+    editorMode,
+    sourceContent,
+  });
+
+  // 从文章数据初始化标题和元数据
+  if (article && prevArticleId !== article.id) {
+    setPrevArticleId(article.id);
+    setTitle(article.title || "");
+    initFromData(article);
+  }
+
+  // 同步编辑器内容
+  // 使用 queueMicrotask 延迟 setContent，避免在 React commit 阶段中
+  // 触发 tiptap ReactNodeViewRenderer 内部的 flushSync 调用
+  const editorSyncedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!article || !editor || editor.isDestroyed) return;
+    if (editorSyncedRef.current === article.id) return;
+    editorSyncedRef.current = article.id;
+    const contentHtml = article.content_html?.trim();
+    const contentMd = article.content_md?.trim();
+    queueMicrotask(() => {
+      if (editor.isDestroyed) return;
+      if (contentHtml) {
+        editor.commands.setContent(contentHtml);
+        return;
+      }
+      // 兼容仅返回 Markdown、或历史数据中 content_html 为空的场景：用 MD 转 HTML 初始化可视化编辑器
+      if (contentMd) {
+        const html = fixTaskListHtml(marked.parse(contentMd, { async: false }) as string);
+        editor.commands.setContent(html);
+        setSourceContent(contentMd);
+      }
+    });
+  }, [article, editor]);
+
+  // 保存文章
+  const handleSave = async () => {
+    const currentTitle = title.trim();
+    const currentStatus = meta.status;
+
+    if (currentStatus !== "DRAFT" && !currentTitle) {
+      addToast({ title: "发布文章前请输入标题", color: "warning" });
+      return;
+    }
+
+    const wasNewArticle = !currentArticleId;
+    try {
+      const outcome = await saveNow();
+      if (wasNewArticle && !outcome.id) {
+        addToast({
+          title: "没有可保存的内容",
+          color: "warning",
+        });
+        return;
+      }
+      addToast({
+        title:
+          currentStatus === "DRAFT"
+            ? "草稿已保存"
+            : wasNewArticle
+              ? "文章已发布"
+              : "文章已更新",
+        color: "success",
+      });
+      if (wasNewArticle) {
+        router.push("/admin/post-management");
+      }
+    } catch (error) {
+      addToast({
+        title: wasNewArticle ? "发布失败" : "更新失败",
+        description: error instanceof Error ? error.message : "保存文章失败",
+        color: "danger",
+      });
+    }
+  };
+
+  const handleBack = useCallback(async () => {
+    try {
+      await flushSave();
+      router.push("/admin/post-management");
+    } catch (error) {
+      addToast({
+        title: "保存失败，已留在当前页面",
+        description: error instanceof Error ? error.message : "请重试后再离开",
+        color: "danger",
+      });
+    }
+  }, [flushSave, router]);
+
+  const getBodyPlainTextForSummary = useCallback(() => {
+    if (editorMode === "visual" && editor && !editor.isDestroyed) {
+      return editor.getText();
+    }
+    if (editorMode === "html") {
+      return plainTextFromHtmlSource(sourceContent);
+    }
+    return roughPlainTextFromMarkdown(sourceContent);
+  }, [editorMode, editor, sourceContent]);
+
+  // 编辑模式加载中
+  if (isEditMode && isLoadingArticle) {
+    return (
+      <div className="flex flex-col h-screen items-center justify-center gap-3 bg-background">
+        <Spinner size="lg" />
+        <p className="text-muted-foreground">加载文章中...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-screen bg-background overflow-hidden">
+      {/* 标题栏 - 专注模式下隐藏 */}
+      {!focusMode && (
+        <EditorHeader
+          title={title}
+          onTitleChange={setTitle}
+          onSave={handleSave}
+          isSaving={isSaving}
+          isEditMode={isEditMode}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          articleId={currentArticleId}
+          isDoc={meta.is_doc}
+          autoSaveStatus={autoSaveStatus}
+          lastSavedAt={lastSavedAt}
+          articleUpdatedAt={article?.updated_at}
+          focusMode={focusMode}
+          onToggleFocusMode={toggleFocusMode}
+          onBack={handleBack}
+        />
+      )}
+
+      {/* 工具栏 - 专注模式下隐藏桌面端工具栏 */}
+      {!focusMode && (
+        <div className="hidden md:block">
+          <EditorToolbar editor={editor} editorMode={editorMode} onModeChange={handleModeChange} />
+        </div>
+      )}
+
+      {/* 主体区域：编辑器 + 大纲（固定布局） */}
+      <div className="flex flex-1 min-h-0 overflow-hidden relative">
+        {/* 编辑器区域 - 始终占满剩余空间 */}
+        <div className="flex-1 min-h-0 relative flex flex-col">
+          {/* TipTap 始终挂载，源码模式时隐藏（避免 flushSync 重挂载错误） */}
+          <div className={editorMode === "visual" ? "flex-1 overflow-auto bg-card" : "hidden"}>
+            <div className="max-w-4xl mx-auto">
+              <TiptapEditor editor={editor} />
+            </div>
+          </div>
+          {editorMode === "visual" && <WordCount editor={editor} />}
+          {editorMode !== "visual" && (
+            <SourceCodeEditor
+              value={sourceContent}
+              onChange={handleSourceChange}
+              language={editorMode === "html" ? "html" : "markdown"}
+            />
+          )}
+        </div>
+
+        {/* 大纲面板 - 仅可视化模式且非专注模式显示 */}
+        {editorMode === "visual" && !focusMode && (
+          <div className="w-64 shrink-0 h-full overflow-auto py-4 px-5">
+            <h3 className="text-base font-bold text-foreground mb-3 pl-1">大纲</h3>
+            <div className="border-l-2 border-border/60 pl-2">
+              <TOCContent editor={editor} />
+            </div>
+          </div>
+        )}
+
+        {/* 文章设置面板 - 专注模式下隐藏 */}
+        {sidebarOpen && !focusMode && (
+          <div className="absolute top-0 right-0 h-full w-64 z-20 bg-background border-l-[0.5px] border-border/60 shadow-md overflow-auto">
+            <EditorSidebar
+              meta={meta}
+              onUpdateField={updateField}
+              isAdmin={isAdmin}
+              categories={categories}
+              tags={tags}
+              isLoadingCategories={isLoadingCategories}
+              isLoadingTags={isLoadingTags}
+              editorVariant="app"
+              getBodyPlainTextForSummary={getBodyPlainTextForSummary}
+              editor={editor}
+              articleTitle={title}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* 移动端底部工具栏 */}
+      <MobileToolbar editor={editor} />
+
+      {/* 专注模式退出按钮 */}
+      {focusMode && (
+        <button
+          type="button"
+          onClick={() => setFocusMode(false)}
+          className="fixed top-4 right-4 z-50 px-3 py-1.5 text-xs text-muted-foreground bg-card/80 backdrop-blur border border-border rounded-lg shadow-sm hover:bg-card transition-all opacity-0 hover:opacity-100 focus:opacity-100"
+        >
+          ESC 退出专注模式
+        </button>
+      )}
+    </div>
+  );
+}
