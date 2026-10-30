@@ -60,8 +60,12 @@ func NewSQLDB(cfg *config.Config) (*sql.DB, error) {
 		if dbUser == "" || dbHost == "" || dbPort == "" || dbName == "" {
 			return nil, fmt.Errorf("PostgreSQL 连接参数不完整 (需要 User, Host, Port, Name)")
 		}
-		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-			dbHost, dbPort, dbUser, dbPass, dbName)
+		sslMode := cfg.GetString(config.KeyDBSSLMode)
+		if sslMode == "" {
+			sslMode = "disable"
+		}
+		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			dbHost, dbPort, dbUser, dbPass, dbName, sslMode)
 	case "sqlite", "sqlite3":
 		driverName = "sqlite3"
 
