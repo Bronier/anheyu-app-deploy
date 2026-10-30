@@ -34,6 +34,7 @@ const (
 	KeyDBUser        = "Database.User"
 	KeyDBPassword    = "Database.Password"
 	KeyDBName        = "Database.Name"
+	KeyDBSSLMode     = "Database.SSLMode"
 	KeyDBDebug       = "Database.Debug"
 	KeyRedisAddr     = "Redis.Addr"
 	KeyRedisPassword = "Redis.Password"
