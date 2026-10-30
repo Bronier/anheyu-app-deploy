@@ -1,0 +1,89 @@
+# Deployment Dockerfile for anheyu-app on Render's free tier.
+#
+# The upstream Dockerfile expects `frontend/.next/standalone` to already exist
+# (CI builds it). On Render the build container is also free-tier sized, so we
+# build the Next.js frontend inside the image instead of shipping prebuilt
+# artefacts, and keep the final image small.
+#
+#   builder  -> builds the Next.js standalone bundle
+#   backend  -> compiles the Go binary with the frontend embedded
+#   runtime  -> alpine + node + ffmpeg, runs both processes under one entrypoint
+
+# ---------------- Stage 1: Next.js frontend ----------------
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /build/frontend
+
+# Install dependencies first so the layer caches across code changes
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ ./
+# next.config.ts sets output: "standalone"
+RUN npm run build
+
+# ---------------- Stage 2: Go backend ----------------
+FROM golang:1.25-alpine AS backend-builder
+
+ARG VERSION=unknown
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Embed the freshly built frontend into the Go binary so the runtime needs
+# no separate asset directory. Mirrors scripts/prepare-embedded-frontend.sh.
+RUN mkdir -p internal/frontend/embedded_assets/runtime/frontend \
+ && cp -a frontend/.next/standalone/. internal/frontend/embedded_assets/runtime/frontend/ \
+ && mkdir -p internal/frontend/embedded_assets/runtime/frontend/.next/static \
+ && cp -a frontend/.next/static/. internal/frontend/embedded_assets/runtime/frontend/.next/static/ \
+ && mkdir -p internal/frontend/embedded_assets/runtime/frontend/public \
+ && cp -a frontend/public/. internal/frontend/embedded_assets/runtime/frontend/public/ \
+ && printf '{\n  "project": "anheyu-app",\n  "version": "%s",\n  "commit": "%s",\n  "build_date": "%s"\n}\n' \
+      "$VERSION" "$COMMIT" "$BUILD_DATE" > internal/frontend/embedded_assets/runtime/manifest.json
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath \
+      -ldflags "-X 'github.com/anzhiyu-c/anheyu-app/internal/pkg/version.Version=${VERSION}' \
+                -X 'github.com/anzhiyu-c/anheyu-app/internal/pkg/version.Commit=${COMMIT}' \
+                -X 'github.com/anzhiyu-c/anheyu-app/internal/pkg/version.Date=${BUILD_DATE}'" \
+      -o /build/anheyu-app .
+
+# ---------------- Stage 3: runtime ----------------
+FROM alpine:3.20 AS runtime
+
+RUN apk update \
+ && apk add --no-cache tzdata vips-tools ffmpeg libheif libraw-tools nodejs npm su-exec ca-certificates \
+ && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && echo "Asia/Shanghai" > /etc/timezone
+
+WORKDIR /anheyu
+
+RUN addgroup --system --gid 1001 anheyu \
+ && adduser --system --uid 1001 anheyu \
+ && mkdir -p ./themes ./data
+
+COPY --from=backend-builder /build/anheyu-app ./anheyu-app
+COPY default_files ./default-data
+COPY entrypoint.sh ./entrypoint.sh
+
+RUN chmod +x ./anheyu-app ./entrypoint.sh \
+ && chown -R anheyu:anheyu /anheyu
+
+ENV AN_SETTING_DEFAULT_ENABLE_FFMPEG_GENERATOR=true \
+    AN_SETTING_DEFAULT_ENABLE_VIPS_GENERATOR=true \
+    AN_SETTING_DEFAULT_ENABLE_LIBRAW_GENERATOR=true \
+    NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    ANHEYU_FRONTEND_PORT=3000
+
+EXPOSE 8091 3000
+
+ENTRYPOINT ["./entrypoint.sh"]
+CMD ["./anheyu-app"]
