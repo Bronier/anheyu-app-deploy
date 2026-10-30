@@ -1,13 +1,13 @@
 # Deployment Dockerfile for anheyu-app on Render's free tier.
 #
-# Upstream expects `frontend/.next/standalone` to pre-exist (CI builds it).
-# On Render we build the Next.js bundle inside the image and copy it across
-# build stages explicitly, then embed it into the Go binary so the runtime
-# image needs no separate asset directory.
-#
 #   stage 1 (frontend-builder) -> npm ci + next build  => .next/standalone
-#   stage 2 (backend-builder)  -> copy stage-1 output, embed, go build
-#   stage 3 (runtime)          -> alpine + node + ffmpeg, runs both processes
+#   stage 2 (backend-builder)  -> compile the Go binary
+#   stage 3 (runtime)          -> alpine + node + ffmpeg, frontend at /anheyu/frontend
+#
+# The Go backend reverse-proxies the Next.js standalone server. `launcher.go`
+# resolves the frontend at $ANHEYU_FRONTEND_DIR (default ./frontend, i.e.
+# /anheyu/frontend) and runs `node server.js` from there, so the standalone
+# bundle must land in that directory inside the image.
 
 # ---------------- Stage 1: Next.js frontend ----------------
 FROM node:20-alpine AS frontend-builder
@@ -38,25 +38,6 @@ RUN go mod download
 
 COPY . .
 
-# Pull the freshly built Next.js bundle out of stage 1. `.next` is gitignored,
-# so it can only arrive via a cross-stage COPY.
-COPY --from=frontend-builder /build/frontend/.next/standalone/. ./frontend/.next/standalone/
-COPY --from=frontend-builder /build/frontend/.next/static/.     ./frontend/.next/static/
-COPY --from=frontend-builder /build/frontend/public/.           ./frontend/public/
-
-# Embed the frontend into the Go binary (mirrors
-# scripts/prepare-embedded-frontend.sh).
-RUN set -eux; \
-    mkdir -p internal/frontend/embedded_assets/runtime/frontend; \
-    cp -a frontend/.next/standalone/. internal/frontend/embedded_assets/runtime/frontend/; \
-    mkdir -p internal/frontend/embedded_assets/runtime/frontend/.next/static; \
-    cp -a frontend/.next/static/. internal/frontend/embedded_assets/runtime/frontend/.next/static/; \
-    mkdir -p internal/frontend/embedded_assets/runtime/frontend/public; \
-    cp -a frontend/public/. internal/frontend/embedded_assets/runtime/frontend/public/; \
-    printf '{\n  "project": "anheyu-app",\n  "version": "%s",\n  "commit": "%s",\n  "build_date": "%s"\n}\n' \
-      "$VERSION" "$COMMIT" "$BUILD_DATE" > internal/frontend/embedded_assets/runtime/manifest.json; \
-    ls internal/frontend/embedded_assets/runtime/frontend/server.js
-
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
       -ldflags "-X 'github.com/anzhiyu-c/anheyu-app/internal/pkg/version.Version=${VERSION}' \
@@ -79,6 +60,13 @@ RUN addgroup --system --gid 1001 anheyu \
  && mkdir -p ./themes ./data ./frontend
 
 COPY --from=backend-builder /build/anheyu-app ./anheyu-app
+
+# Next.js standalone bundle: server.js + minimal node_modules
+COPY --from=frontend-builder /build/frontend/.next/standalone/ ./frontend/
+# Static chunks and public assets are NOT part of standalone; copy them in.
+COPY --from=frontend-builder /build/frontend/.next/static/     ./frontend/.next/static/
+COPY --from=frontend-builder /build/frontend/public/           ./frontend/public/
+
 COPY default_files ./default-data
 COPY entrypoint.sh ./entrypoint.sh
 
@@ -89,6 +77,7 @@ ENV AN_SETTING_DEFAULT_ENABLE_FFMPEG_GENERATOR=true \
     AN_SETTING_DEFAULT_ENABLE_VIPS_GENERATOR=true \
     AN_SETTING_DEFAULT_ENABLE_LIBRAW_GENERATOR=true \
     NODE_ENV=production \
+    ANHEYU_FRONTEND_DIR=/anheyu/frontend \
     ANHEYU_FRONTEND_PORT=3000
 
 EXPOSE 10000
