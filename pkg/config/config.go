@@ -21,7 +21,7 @@ import (
 // 定义所有已知的配置键
 var allKeys = []string{
 	KeyServerPort, KeyServerDebug,
-	KeyDBType, KeyDBHost, KeyDBPort, KeyDBUser, KeyDBPassword, KeyDBName, KeyDBDebug,
+	KeyDBType, KeyDBHost, KeyDBPort, KeyDBUser, KeyDBPassword, KeyDBName, KeyDBSSLMode, KeyDBDebug,
 	KeyRedisAddr, KeyRedisPassword, KeyRedisDB,
 }
 
