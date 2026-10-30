@@ -1,0 +1,45 @@
+# Render Blueprint for anheyu-app (Go backend + Next.js 16 frontend in one container).
+#
+# Free tier notes:
+#   - 512 MB RAM / 0.1 CPU, 750 instance-hours per month
+#   - spins down after 15 minutes without inbound traffic
+#   - NO persistent disk -> SQLite data does NOT survive restarts.
+#     We therefore point the app at an external PostgreSQL instance.
+#   - `onrender.com` subdomain + automatic HTTPS are included for free.
+
+services:
+  - type: web
+    name: anheyu-app
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /api/version
+    envVars:
+      - key: ANHEYU_SYSTEM_PORT
+        value: "8091"
+      - key: ANHEYU_SYSTEM_DEBUG
+        value: "false"
+      - key: ANHEYU_DATABASE_TYPE
+        value: postgres
+      # Filled in from the Render dashboard / external Postgres provider
+      - key: ANHEYU_DATABASE_HOST
+        sync: false
+      - key: ANHEYU_DATABASE_PORT
+        value: "5432"
+      - key: ANHEYU_DATABASE_USER
+        sync: false
+      - key: ANHEYU_DATABASE_PASSWORD
+        sync: false
+      - key: ANHEYU_DATABASE_NAME
+        sync: false
+      # Leave Redis empty -> the app falls back to an in-memory cache
+      - key: ANHEYU_REDIS_ADDR
+        value: ""
+      - key: ANHEYU_FRONTEND_PORT
+        value: "3000"
+      - key: NODE_ENV
+        value: production
